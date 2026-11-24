@@ -3563,6 +3563,7 @@ function autoReportOverview(report) {
     <header class="auto-overview-head">
       <p class="auto-report-scope"><span>${report.models.length} 组模型</span><span>同一批 ${report.matched_case_count} 条测试</span></p>
       <h2>${autoText(report.title)}</h2>
+      ${window.STATIC_SNAPSHOT?.feedback_url?'<a class="btn small primary" data-auto-feedback-link target="_blank" rel="noopener noreferrer">填写本条反馈</a>':''}
       ${autoState.job?.pilot_preview?'<a class="btn small" href="/review-versions/V1" target="_blank" rel="noopener">查看 V1 输入预览</a>':''}
       ${revised.length?`<p class="callout">本版复评 ${autoText(revised.join('；'))}。其余分镜沿用原报告。</p>`:''}
       ${revised.length&&report.shot_summary?`<p class="auto-conclusion">${autoText(report.shot_summary)}</p>`:''}
@@ -3713,16 +3714,16 @@ function autoCasePager(cases) {
   const feedback=autoState.job?.feedback;
   const feedbackUrl=window.STATIC_SNAPSHOT?.feedback_url;
   return `<div class="auto-case-pager">
-    <div class="auto-case-navigation" role="group" aria-label="切换测试用例" ${cases.length<2?'hidden':''}>
+    <div class="auto-case-navigation" role="group" aria-label="切换测试用例" ${cases.length<2&&!feedbackUrl?'hidden':''}>
       <button class="btn small" type="button" data-action="auto-case-step" data-step="-1">‹ 上一条</button>
       <select data-auto-case-select aria-label="跳转到指定用例">${cases.map((item,i)=>
         `<option value="${autoText(item.id)}">${i+1} / ${cases.length} · ${autoText(item.heading)}</option>`).join('')}</select>
       <button class="btn small" type="button" data-action="auto-case-step" data-step="1">下一条 ›</button>
+      ${feedbackUrl?'<a class="btn small primary" data-auto-feedback-link target="_blank" rel="noopener noreferrer">填写本条反馈</a>':''}
     </div>
     ${cases.map(item=>`<section class="auto-case auto-case-page" data-auto-case-page="${autoText(item.id)}" hidden
       ${feedback?.targets[item.id]?`data-auto-review-case="${autoText(item.id)}" data-reviewed="${feedback.records[item.id]?.recommendation_agrees!=null||!feedback.targets[item.id].leaders.length}"`:''}>
       <header class="auto-case-heading"><h3 tabindex="-1">${autoText(item.heading)}</h3>
-        ${feedbackUrl?`<a class="btn small" href="${autoText(feedbackUrl)}#case=${route(item.id)}" target="_blank" rel="noopener noreferrer">填写本条反馈</a>`:''}
         ${feedback?.targets[item.id]?`<span data-auto-feedback-label>${autoFeedbackLabel(item.id)}</span>`:''}</header>
       ${item.body}
     </section>`).join('')}
@@ -3759,6 +3760,9 @@ function autoShowCase(id,focus=false) {
   if(firstShot&&!current.querySelector('[data-auto-shot-choice][aria-pressed="true"]'))autoSelectShot(current,firstShot);
   const pager=current.parentElement;
   pager.querySelector('[data-auto-case-select]').value=current.dataset.autoCasePage;
+  for(const link of $('auto-result').querySelectorAll('[data-auto-feedback-link]')){
+    link.href=window.STATIC_SNAPSHOT.feedback_url+'#case='+route(current.dataset.autoCasePage);
+  }
   pager.querySelector('[data-step="-1"]').disabled=index===0;
   pager.querySelector('[data-step="1"]').disabled=index===pages.length-1;
   saved('automatic-case:'+autoState.job.id,current.dataset.autoCasePage);

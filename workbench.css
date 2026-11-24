@@ -1034,6 +1034,11 @@ body.auto-report-mode:not([data-share="automatic"]) #auto-trace { scroll-margin-
 .auto-case-pager { scroll-margin-top: 14px; }
 .auto-case-navigation { display: grid; position: sticky; top: 0; z-index: 2; grid-template-columns: max-content minmax(0,1fr) max-content; gap: 8px; margin: 12px 0 6px; padding: 6px 0; background: var(--panel); }
 .auto-case-navigation select { min-width: 0; margin: 0; }
+.auto-case-navigation:has([data-auto-feedback-link]) { grid-template-columns: max-content minmax(0,1fr) max-content max-content; }
+@media (max-width: 600px) {
+  .auto-case-navigation:has([data-auto-feedback-link]) { grid-template-columns: max-content minmax(0,1fr) max-content; }
+  .auto-case-navigation [data-auto-feedback-link] { grid-column: 1 / -1; justify-self: end; }
+}
 .auto-case-page { padding: clamp(8px,1.3vw,18px); }
 .auto-case-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; margin-bottom: 10px; }
 .auto-case-heading h3 { margin: 0; font-size: 20px; }
