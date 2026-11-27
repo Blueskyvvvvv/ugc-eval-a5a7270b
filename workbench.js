@@ -1328,7 +1328,7 @@ let lightboxSerial = 0;
 function mediaFigure(asset, label, kind) {
   const url=stepMediaURL(asset);
   if (!url) return '';
-  return `<figure class="f-media-item">${kind==='video'?`<video controls playsinline preload="metadata" src="${escapeHtml(url)}"></video>`:`<a href="${escapeHtml(url)}" target="_blank" rel="noopener" data-lightbox="media-${lightboxSerial}" data-caption="${escapeHtml(label)}"><img src="${escapeHtml(url)}" alt="${escapeHtml(label)}"></a>`}<figcaption>${escapeHtml(label)}</figcaption></figure>`;
+  return `<figure class="f-media-item">${kind==='video'?`<video controls playsinline preload="metadata" src="${escapeHtml(url)}"></video>`:`<a href="${escapeHtml(url)}" target="_blank" rel="noopener" data-lightbox="media-${lightboxSerial}" data-caption="${escapeHtml(label)}"><img loading="lazy" decoding="async" src="${escapeHtml(url)}" alt="${escapeHtml(label)}"></a>`}<figcaption>${escapeHtml(label)}</figcaption></figure>`;
 }
 function friendlyMedia(sample={}) {
   const refs=(sample.reference_images||[]).map((r,i,all)=>mediaFigure(r, all.length>1?`参考图 ${i+1}`:'参考图','image'));
@@ -4215,7 +4215,15 @@ function autoShowCase(id,focus=false) {
   autoShotTooltip(null);
   autoCloseFinding();
   for(const page of pages){
-    if(page!==current&&!page.hidden)autoStopPlayback(page);
+    if(page!==current&&!page.hidden){
+      autoStopPlayback(page);
+      if(window.STATIC_SNAPSHOT){
+        for(const video of page.querySelectorAll('video[data-src][src]')){
+          video.removeAttribute('src');
+          video.load();
+        }
+      }
+    }
     page.hidden=page!==current;
   }
   current.querySelectorAll('video[data-src]').forEach(video=>{
