@@ -996,14 +996,8 @@ const notice = (text, kind = '') => { const e = $('message'); e.hidden = false; 
 const errorMessage = err => { const message=String(err.message || '请求失败').replace(/[a-f0-9]{32,}/gi,'[内部记录]').replace(/\b(?:asset|run|trial|generation)-[a-z0-9_-]+/gi,'相关记录').replace(/\bcase\b/gi,'样例').replace(/\b(?:sha256|JSON)\b/gi,'记录'); return /[\u3400-\u9fff]/.test(message) ? localizeError(message) : '操作未完成，请检查所选内容和参数。'; };
 // 静态报告（导出到静态网站）：所有数据来自页面里的快照，不访问工作台接口。
 function staticApi(path, body) {
+  if (body !== undefined) throw new Error('这是导出的静态报告，只能查看，不能提交或修改。');
   const snap = window.STATIC_SNAPSHOT;
-  if (body !== undefined) {
-    const cached = snap.translations?.[path];
-    if (cached && body.shot_index === undefined) return structuredClone(cached);
-    const translation = cached?.shot_translations[body.shot_index];
-    if (translation) return {translation};
-    throw new Error('这是只读报告，无法提交内容或调用模型。');
-  }
   if (path in snap) return structuredClone(snap[path]);
   const events = /^\/api\/runs\/([^/?]+)\/events\?/.exec(path);
   if (events) return {events: [], last_seq: snap[`/api/runs/${events[1]}?view=compact`]?.last_seq ?? 0};
@@ -1334,7 +1328,7 @@ let lightboxSerial = 0;
 function mediaFigure(asset, label, kind) {
   const url=stepMediaURL(asset);
   if (!url) return '';
-  return `<figure class="f-media-item">${kind==='video'?`<video controls playsinline preload="metadata" src="${escapeHtml(url)}"></video>`:`<a href="${escapeHtml(url)}" target="_blank" rel="noopener" data-lightbox="media-${lightboxSerial}" data-caption="${escapeHtml(label)}"><img loading="lazy" decoding="async" src="${escapeHtml(url)}" alt="${escapeHtml(label)}"></a>`}<figcaption>${escapeHtml(label)}</figcaption></figure>`;
+  return `<figure class="f-media-item">${kind==='video'?`<video controls playsinline preload="metadata" src="${escapeHtml(url)}"></video>`:`<a href="${escapeHtml(url)}" target="_blank" rel="noopener" data-lightbox="media-${lightboxSerial}" data-caption="${escapeHtml(label)}"><img src="${escapeHtml(url)}" alt="${escapeHtml(label)}"></a>`}<figcaption>${escapeHtml(label)}</figcaption></figure>`;
 }
 function friendlyMedia(sample={}) {
   const refs=(sample.reference_images||[]).map((r,i,all)=>mediaFigure(r, all.length>1?`参考图 ${i+1}`:'参考图','image'));
@@ -2931,6 +2925,11 @@ async function initAutomaticReportShare(requestedCase=new URLSearchParams(locati
     $('auto-feedback-dock').classList.add('is-open');
     $('auto-feedback-toggle').setAttribute('aria-expanded','true');
   }
+  if(job.feedback_refinement?.available&&job.feedback.reviewed===job.feedback.total&&!job.feedback_refinement.history.length){
+    try {await autoRefreshRefinement(job,{action:'start'});}
+    catch(error) {notice(errorMessage(error),'error');}
+    requestAnimationFrame(autoShowFeedbackRefinement);
+  }
 }
 async function initShare(reportId) {
   state.taskInclude={};
@@ -2958,7 +2957,11 @@ async function init() {
   // 先记下报告地址：后面恢复上次页面时会清掉地址中的 #report=。
   const reportId=location.hash.startsWith('#report=')?decodeURIComponent(location.hash.slice(8)):null;
   try {
-    if(AUTOMATIC_REPORT_SHARE){await initAutomaticReportShare();return;}
+    if(AUTOMATIC_REPORT_SHARE){
+      await initAutomaticReportShare();
+      if(!window.STATIC_SNAPSHOT)state.timer=setInterval(autoPoll,1500);
+      return;
+    }
     const health=await api('/api/health');state.confirmAvailable=health.template_confirmation_available===true;
     state.metricBackend=health.metric_backend;
     $('health').textContent=health.worker_alive?'服务运行中':'工作进程已停止';$('health').className='badge '+(health.worker_alive?'ok':'bad');
@@ -3036,10 +3039,49 @@ async function autoList() {
   markActive('auto-open',autoState.selected);
   if(!jobs.length&&autoState.role==='designer')$('auto-form-panel').open=true;
 }
-async function autoOpen(id) {
-  const serial=++autoState.requestSerial;
+function autoDetailsByKey(result) {
+  const keys=new Map(), counts=new Map();
+  for(const panel of result.querySelectorAll('details')){
+    const parent=panel.parentElement.closest('details');
+    const label=panel.dataset.autoDetailsKey||panel.id||panel.querySelector(':scope > summary')?.textContent.trim();
+    const group=JSON.stringify([keys.get(parent),label]);
+    const count=(counts.get(group)||0)+1;
+    counts.set(group,count);
+    keys.set(panel,JSON.stringify([group,count]));
+  }
+  return keys;
+}
+function autoRenderProgress(job) {
+  const result=$('auto-result');
+  const details=new Map([...autoDetailsByKey(result)].map(([panel,key])=>[key,panel.open]));
+  const panel=$('auto-trace'), selection=$('auto-trace-select')?.value;
+  const {scrollX,scrollY}=window;
+  const top=result.scrollTop;
+  autoRender(job);
+  for(const [item,key] of autoDetailsByKey(result))if(details.has(key))item.open=details.get(key);
+  const select=$('auto-trace-select');
+  if(select&&[...select.options].some(option=>option.value===selection))select.value=selection;
+  if(panel?.childNodes.length){
+    const placeholder=$('auto-trace');
+    const trigger=result.querySelector(`[data-action="auto-show-trace"][data-id="${CSS.escape(panel.dataset.traceId)}"]`);
+    if(placeholder)placeholder.replaceWith(panel);
+    else if(trigger)trigger.after(panel);
+    else result.append(panel);
+  }
+  result.scrollTop=top;
+  window.scrollTo(scrollX,scrollY);
+}
+async function autoOpen(id,{poll=false}={}) {
+  const serial=poll?autoState.requestSerial:++autoState.requestSerial;
   const job=await api(AUTO_API+'/'+route(id));
   if(serial!==autoState.requestSerial||!autoState.role)return;
+  if(poll){
+    const shown=autoState.job;
+    if(shown?.id!==id||job.status===shown.status&&JSON.stringify(job.result)===JSON.stringify(shown.result))return;
+    autoState.job=job;
+    autoRenderProgress(job);
+    return job;
+  }
   const resultChanged=autoState.job?.id!==id;
   if(resultChanged)autoState.radarHidden.clear();
   autoState.selected=id;
@@ -3228,6 +3270,7 @@ function autoFeedbackSummary() {
   const data=autoState.job?.feedback;
   if(!data)return '';
   const count=data.recommendation_reviewed;
+  const summaryReady=autoState.job.feedback_refinement?.available&&data.reviewed===data.total;
   const eligible=Object.values(data.targets).filter(target=>target.leaders.length>0).length;
   const observations=Object.values(data.records).filter(record=>record.observations).length;
   const agreement=count?
@@ -3239,12 +3282,85 @@ function autoFeedbackSummary() {
       <span>已写观察 <b>${observations}/${data.total} 条</b></span>
       ${agreement}
     </div>
-    ${autoState.role==='designer'&&count<eligible?`<button class="btn small" type="button" data-action="auto-feedback-next">${count?'下一条未填推荐判断':'开始核对推荐'}</button>`:''}
+    ${summaryReady?'<button class="btn small primary" type="button" data-action="auto-refinement-view">查看反馈总结</button>':
+      autoState.role==='designer'&&count<eligible?`<button class="btn small" type="button" data-action="auto-feedback-next">${count?'下一条未填推荐判断':'开始核对推荐'}</button>`:''}
   </aside>`;
 }
 
 function autoFeedbackDraftKey(job,caseId) {
   return ['automatic-feedback',job.id,job.feedback_reviewer?.id,job.feedback.version,caseId].filter(Boolean).join(':');
+}
+
+const autoFeedbackImageDrafts=new Map();
+const autoFeedbackSaveTimers=new Map();
+const autoFeedbackSaving=new Set();
+const autoFeedbackStale=new WeakSet();
+const autoFeedbackRefreshMessage='报告已更新，请刷新页面后再提交，草稿会保留';
+
+function autoFeedbackImages(job,caseId) {
+  return autoFeedbackImageDrafts.get(autoFeedbackDraftKey(job,caseId))??job.feedback.records[caseId]?.images??[];
+}
+
+function autoFeedbackImageList(images,editable=false) {
+  if(!images.length)return '';
+  const group='feedback-'+(++lightboxSerial);
+  return `<ul class="auto-feedback-images">${images.map((image,index)=>{
+    const url='data:image/jpeg;base64,'+autoText(image);
+    const label=`反馈图片 ${index+1}`;
+    return `<li><a href="${url}" data-lightbox="${group}" data-caption="${label}"><img loading="lazy" src="${url}" alt="${label}"></a>
+      ${editable?`<button type="button" class="btn small" data-action="auto-remove-feedback-image" data-index="${index}" aria-label="移除${label}">移除</button>`:''}</li>`;
+  }).join('')}</ul>`;
+}
+
+function autoUpdateFeedbackImages(form,images) {
+  const box=form.closest('[data-auto-feedback-case]');
+  const job=autoState.job;
+  autoFeedbackImageDrafts.set(autoFeedbackDraftKey(job,box.dataset.autoFeedbackCase),images);
+  form.querySelector('[data-auto-feedback-images]').innerHTML=autoFeedbackImageList(images,true);
+  autoScheduleFeedbackSave(job,box.dataset.autoFeedbackCase,0);
+}
+
+async function autoAttachFeedbackImages(form,files) {
+  const status=form.querySelector('[data-auto-feedback-image-status]');
+  const job=autoState.job;
+  const caseId=form.closest('[data-auto-feedback-case]').dataset.autoFeedbackCase;
+  const key=autoFeedbackDraftKey(job,caseId);
+  const images=autoFeedbackImages(job,caseId);
+  if(form.dataset.processingImages)return;
+  if(images.length+files.length>3){status.textContent='每条反馈最多添加 3 张图片。';return;}
+  form.dataset.processingImages='1';
+  status.textContent='正在处理图片…';
+  try {
+    const attached=[];
+    for(const file of files){
+      if(file.size>20*1024*1024)throw new Error('原图超过 20 MB，请先缩小再添加。');
+      const bitmap=await createImageBitmap(file);
+      try {
+        const scale=Math.min(1,1600/Math.max(bitmap.width,bitmap.height));
+        const canvas=document.createElement('canvas');
+        canvas.width=Math.max(1,Math.round(bitmap.width*scale));
+        canvas.height=Math.max(1,Math.round(bitmap.height*scale));
+        const context=canvas.getContext('2d');
+        context.fillStyle='#fff';
+        context.fillRect(0,0,canvas.width,canvas.height);
+        context.drawImage(bitmap,0,0,canvas.width,canvas.height);
+        let image=canvas.toDataURL('image/jpeg',0.85).split(',')[1];
+        if(image.length>699052)image=canvas.toDataURL('image/jpeg',0.65).split(',')[1];
+        if(image.length>699052)throw new Error('图片压缩后仍过大，请裁剪后再添加。');
+        attached.push(image);
+      } finally {bitmap.close();}
+    }
+    const next=[...autoFeedbackImages(job,caseId),...attached];
+    if(next.length>3)throw new Error('每条反馈最多添加 3 张图片。');
+    if(form.isConnected&&autoState.job===job)autoUpdateFeedbackImages(form,next);
+    else {
+      autoFeedbackImageDrafts.set(key,next);
+      autoScheduleFeedbackSave(job,caseId,0);
+    }
+    status.textContent='';
+  } catch(error) {
+    status.textContent=/[\u3400-\u9fff]/.test(error.message)?error.message:'无法读取这张图片，请换一张再试。';
+  } finally {delete form.dataset.processingImages;}
 }
 
 function autoFeedbackValues(form) {
@@ -3262,7 +3378,10 @@ function autoFeedbackBox(caseId,title) {
   const {leaders}=job.feedback.targets[caseId];
   const row=job.feedback.records[caseId];
   const writable=autoState.role==='designer';
-  const draft=writable?read(autoFeedbackDraftKey(job,caseId)):null;
+  const key=autoFeedbackDraftKey(job,caseId);
+  const draft=writable?read(key):null;
+  const hasDraft=Boolean(draft)||writable&&autoFeedbackImageDrafts.has(key);
+  const images=writable?autoFeedbackImages(job,caseId):row?.images||[];
   const stored=draft||row;
   const legacyRecommendation=stored?.issues?.includes('recommendation');
   const agreement=stored?.recommendation_agrees??(legacyRecommendation?false:null);
@@ -3270,7 +3389,7 @@ function autoFeedbackBox(caseId,title) {
   const observations=stored?.observations??(!legacyRecommendation||stored.issues.includes('evidence')?stored?.reason||'':'');
   const modelNames=Object.fromEntries(job.groups.map(group=>[group.id,autoShortModel(group.name)]));
   const best=leaders.length
-    ?`<p class="auto-feedback-recommendation">系统推荐 <strong>${autoText(leaders.map(id=>modelNames[id]).join('、'))}</strong>${leaders.length>1?'（并列）':''}</p>`
+    ?`<p class="auto-feedback-recommendation">${job.product_case_decisions?'原评分推荐':'系统推荐'} <strong>${autoText(leaders.map(id=>modelNames[id]).join('、'))}</strong>${leaders.length>1?'（并列）':''}</p>`
     :'<p class="auto-feedback-recommendation dim">系统暂未给出最佳结果。</p>';
   const models=job.groups.map(group=>{
     const checked=stored?.preferred_models.includes(group.id)?' checked':'';
@@ -3294,7 +3413,7 @@ function autoFeedbackBox(caseId,title) {
   return `<section class="auto-feedback-case" data-auto-feedback-case="${autoText(caseId)}">
     <div class="auto-feedback-heading" tabindex="-1">
       <h2 id="auto-feedback-title">${writable?'用例反馈':'设计师判断'}</h2>
-      <small aria-live="polite" data-auto-feedback-status>${draft?'草稿未提交':autoFeedbackLabel(caseId)}</small>
+      <small aria-live="polite" data-auto-feedback-status>${hasDraft?(autoFeedbackStale.has(job)?autoFeedbackRefreshMessage:'有修改待自动保存'):row?'已保存':autoFeedbackLabel(caseId)}</small>
     </div>
     <p class="auto-feedback-case-name">${autoText(title)}</p>
     ${writable?`<form class="auto-feedback-form">
@@ -3304,11 +3423,19 @@ function autoFeedbackBox(caseId,title) {
       <section class="auto-feedback-section">
         <label for="auto-feedback-observations">其他观察（可选）</label>
         <textarea id="auto-feedback-observations" name="observations" rows="4" maxlength="4000"
-          placeholder="哪里和你看到的不一致？可以写模型、分镜或时间戳。">${autoText(observations)}</textarea>
+          placeholder="可以写模型、分镜或时间戳，也可以直接粘贴截图。">${autoText(observations)}</textarea>
+        <label class="auto-feedback-attach">粘贴截图或选择图片
+          <input type="file" accept="image/*" multiple data-auto-feedback-image-input>
+        </label>
+        <p class="dim" data-auto-feedback-image-status aria-live="polite"></p>
+        <div data-auto-feedback-images>${autoFeedbackImageList(images,true)}</div>
       </section>
-      <button class="btn small primary" type="submit">保存反馈</button>
+      <small class="dim" data-feedback-save-progress>已保存 ${job.feedback.reviewed}/${job.feedback.total} 条 · 修改会自动保存</small>
+      <button class="btn small" type="button" data-action="auto-retry-feedback-save" hidden>重试保存</button>
+      <button class="btn small primary" type="button" data-action="auto-refinement-view" data-feedback-summary-shortcut
+        ${job.feedback_refinement?.available&&job.feedback.reviewed===job.feedback.total?'':'hidden'}>查看反馈总结</button>
     </form>`:`<section class="auto-feedback-section"><h3>最佳结果判断</h3>${best}${savedRecommendation}</section>
-    ${observations?`<section class="auto-feedback-section"><h3>其他观察</h3><div class="auto-feedback-note"><p>${autoText(observations)}</p></div></section>`:''}`}
+    ${observations||images.length?`<section class="auto-feedback-section"><h3>其他观察</h3><div class="auto-feedback-note"><p>${autoText(observations)}</p></div>${autoFeedbackImageList(images)}</section>`:''}`}
   </section>`;
 }
 
@@ -3354,18 +3481,89 @@ function autoFeedbackNext() {
   target.querySelector(':scope > summary')?.focus({preventScroll:true});
 }
 
-async function autoFeedbackSave(box, values) {
-  const caseId=box.dataset.autoFeedbackCase;
-  const job=autoState.job;
+function autoFeedbackSaveStatus(caseId,message,retry=false) {
+  const box=$('auto-feedback-body').querySelector(`[data-auto-feedback-case="${CSS.escape(caseId)}"]`);
+  if(!box)return;
+  box.querySelector('[data-auto-feedback-status]').textContent=message;
+  const button=box.querySelector('[data-action="auto-retry-feedback-save"]');
+  if(button)button.hidden=!retry;
+}
+
+function autoScheduleFeedbackSave(job,caseId,delay=1200) {
+  if(autoState.job!==job||autoState.role!=='designer'||!job.feedback?.targets[caseId])return;
+  const key=autoFeedbackDraftKey(job,caseId);
+  if(!read(key)&&!autoFeedbackImageDrafts.has(key))return;
+  clearTimeout(autoFeedbackSaveTimers.get(key));
+  if(autoFeedbackStale.has(job)){
+    autoFeedbackSaveTimers.delete(key);
+    autoFeedbackSaveStatus(caseId,autoFeedbackRefreshMessage);
+    return;
+  }
+  autoFeedbackSaveStatus(caseId,'有修改待自动保存');
+  autoFeedbackSaveTimers.set(key,setTimeout(()=>{
+    autoFeedbackSaveTimers.delete(key);
+    void autoSaveFeedbackDraft(job,caseId);
+  },delay));
+}
+
+function autoRestoreFeedbackDrafts(job) {
+  for(const caseId of Object.keys(job?.feedback?.targets||{}))autoScheduleFeedbackSave(job,caseId,0);
+}
+
+async function autoSaveFeedbackDraft(job,caseId) {
+  if(autoState.job!==job||autoState.role!=='designer')return;
+  if(autoFeedbackStale.has(job)){
+    autoFeedbackSaveStatus(caseId,autoFeedbackRefreshMessage);
+    return;
+  }
+  const key=autoFeedbackDraftKey(job,caseId);
+  if(autoFeedbackSaving.has(key))return;
+  const draft=read(key), imageDraft=autoFeedbackImageDrafts.get(key);
+  if(!draft&&!imageDraft)return;
+  const existing=job.feedback.records[caseId];
+  const {recommendation_agrees=null,recommendation_reason='',preferred_models=[],observations=''}=draft||existing||{};
+  const values={recommendation_agrees,
+    recommendation_reason:recommendation_agrees===false?recommendation_reason.trim():'',
+    preferred_models:recommendation_agrees===false?preferred_models:[],observations:observations.trim(),
+    images:autoFeedbackImages(job,caseId)};
+  if(recommendation_agrees===false&&(!values.preferred_models.length||!values.recommendation_reason)){
+    autoFeedbackSaveStatus(caseId,'选择最佳模型并填写理由后会自动保存');
+    return;
+  }
+  if(recommendation_agrees===null&&!values.observations&&!values.images.length&&!existing){
+    saved(key,null);
+    autoFeedbackImageDrafts.delete(key);
+    autoFeedbackSaveStatus(caseId,'待核对');
+    return;
+  }
+  const snapshot=JSON.stringify(draft);
+  autoFeedbackSaving.add(key);
+  autoFeedbackSaveStatus(caseId,'正在自动保存…');
+  try {await autoFeedbackSave(job,caseId,values,snapshot,imageDraft);}
+  catch(e) {
+    const stale=e.status>=400&&e.status<500&&['feedback_version_changed','feedback_changed'].includes(e.code);
+    if(stale)autoFeedbackStale.add(job);
+    if(autoState.job===job)autoFeedbackSaveStatus(caseId,stale?autoFeedbackRefreshMessage:'暂未保存，草稿仍在当前浏览器',!stale);
+  }
+  finally {
+    autoFeedbackSaving.delete(key);
+    if(!autoFeedbackStale.has(job)&&((read(key)&&JSON.stringify(read(key))!==snapshot)||
+       (autoFeedbackImageDrafts.has(key)&&autoFeedbackImageDrafts.get(key)!==imageDraft))){
+      autoScheduleFeedbackSave(job,caseId);
+    }
+  }
+}
+
+async function autoFeedbackSave(job,caseId,values,draft,imageDraft) {
   const version=job.feedback.version;
   const path=job.feedback_reviewer?`/api/shared-feedback/${route(caseId)}`:AUTO_API+'/'+route(job.id)+'/feedback/'+route(caseId);
   const key=autoFeedbackDraftKey(job,caseId);
-  const draft=JSON.stringify(read(key));
-  const work=autoState.feedbackQueue.then(()=>api(path,{version,...values}));
+  const work=autoState.feedbackQueue.then(()=>api(path,{version,...values,autosave:true}));
   autoState.feedbackQueue=work.catch(()=>{});
   const feedback=await work;
-  const draftUnchanged=JSON.stringify(read(key))===draft;
+  const draftUnchanged=JSON.stringify(read(key))===draft&&autoFeedbackImageDrafts.get(key)===imageDraft;
   if(draftUnchanged)saved(key,null);
+  if(autoFeedbackImageDrafts.get(key)===imageDraft)autoFeedbackImageDrafts.delete(key);
   if(autoState.job!==job)return;
   const justFinished=job.feedback.reviewed<feedback.total&&feedback.reviewed===feedback.total;
   job.feedback=feedback;
@@ -3374,15 +3572,38 @@ async function autoFeedbackSave(box, values) {
     page.dataset.reviewed=String(feedback.records[caseId]?.recommendation_agrees!=null||!feedback.targets[caseId].leaders.length);
     const badge=page.querySelector('[data-auto-feedback-label]');
     if(badge)badge.textContent=autoFeedbackLabel(caseId);
-    if(!page.hidden&&draftUnchanged)autoRenderFeedback(page);
+    if(!page.hidden&&draftUnchanged)autoFeedbackSaveStatus(caseId,feedback.records[caseId]?'已保存':'待核对');
   }
   const summary=$('auto-result').querySelector('[data-auto-feedback-summary]');
   if(summary)summary.outerHTML=autoFeedbackSummary();
+  const progress=$('auto-feedback-body')?.querySelector('[data-feedback-save-progress]');
+  if(progress)progress.textContent=`已保存 ${feedback.reviewed}/${feedback.total} 条 · 修改会自动保存`;
   if(job.feedback_refinement?.available){
-    await autoRefreshRefinement(job);
-    if(justFinished)document.querySelector('[data-auto-feedback-refinement]')?.scrollIntoView({block:'start'});
+    const ready=feedback.reviewed===feedback.total;
+    const shortcut=$('auto-feedback-body')?.querySelector('[data-feedback-summary-shortcut]');
+    if(shortcut)shortcut.hidden=!ready;
+    autoRenderRefinement();
+    if(!ready)return;
+    if(justFinished&&!document.activeElement?.closest('.auto-feedback-form'))autoShowFeedbackRefinement();
+    try {await autoRefreshRefinement(job);}
+    catch {notice('反馈已保存，暂时无法读取总结状态。','error');return;}
   }
-  notice('已保存这条核对结果。','success');
+}
+
+function autoDiagnosisContent(answers=[]) {
+  if(!answers.length)return '';
+  const labels={already_covered:'原报告已判出',clarify:'待确认反馈指向',audio_review:'交给音画复核',
+    local:'调整指定用例',scene:'调整有共性的用例'};
+  const cases=autoState.job?.result?.report?.comparison?.cases||[];
+  const caseName=id=>cases.find(row=>row.id===id)?.name||id;
+  return `<details class="block" open><summary>系统为什么这样处理</summary><ol>${answers.map(row=>
+    `<li><strong>${autoText(labels[row.decision])}</strong> · ${autoText(row.observed_issue)}
+      <p>原判定 ${autoText(row.original_judgment)}</p>
+      <p>共性检查 ${autoText(row.commonality)}</p>
+      ${row.case_ids.length?`<p>改动范围 ${autoText(row.case_ids.map(caseName).join('、'))}${row.shot?` · 第 ${row.shot} 镜`:''}
+        ${row.axis?` · ${autoText(autoShotMetricNames[row.axis]||row.axis)}`:''}</p>`:''}
+      <p>${autoText(row.reason)}</p>
+      ${row.evidence_ids.length?`<small>原判定记录 ${autoText(row.evidence_ids.join('、'))}</small>`:''}</li>`).join('')}</ol></details>`;
 }
 
 function autoRefinementContent() {
@@ -3391,6 +3612,7 @@ function autoRefinementContent() {
   if(!state?.available||job.feedback.reviewed!==job.feedback.total)return '';
   const writable=autoState.role==='designer';
   const latest=state.history.at(-1);
+  const shared=Boolean(job.feedback_reviewer);
   const summary=state.history.findLast(step=>step.action==='summarize'&&step.status==='completed');
   const problems=summary?.result.summary.problems;
   const version=latest?.result?.version;
@@ -3399,9 +3621,11 @@ function autoRefinementContent() {
     data-action="auto-refinement-${action}">${name}</button>`;
   const isPending=['queued','running'].includes(latest?.status);
   const status=!latest?'所有用例已反馈，可以汇总这轮发现的问题。':
-    isPending?(latest.action==='optimize'?'正在按已确认的问题生成提示词新版本…':'正在整理这轮问题清单…'):
+    isPending?(latest.action==='optimize'?'正在按已确认的问题生成提示词新版本…':
+      latest.action==='confirm'?'正在保存你确认的问题清单…':'正在整理这轮问题清单…'):
     ['failed','interrupted'].includes(latest.status)?autoText(latest.error?.message||'这一轮处理失败。'):
     latest.action==='summarize'?'请核对这份问题清单，可以补充或纠正。':
+    latest.action==='confirm'?'总结已确认，维护员可在这份报告中查看。':
     version?`新评测版本 <strong>${autoText(version.name)}</strong> 已保存。`:'已确认，本轮没有能落实到现有提示词的改动。';
   const instructions=version?.changes.instructions||[];
   const questions=version?.changes.questions||[];
@@ -3410,16 +3634,17 @@ function autoRefinementContent() {
     `<li><b>${autoText(axisName(row.axis))} · 系统提示词</b> ${autoText(row.text)} <small>对应问题 ${row.problems.join('、')}</small></li>`).join('')}${questions.map(row=>
     `<li><b>${autoText(caseName(row.case_id))} · 第 ${row.shot} 镜 · ${autoText(axisName(row.axis))} · ${row.question_id?'改写题目':'新增题目'}</b> ${autoText(row.text)} <small>对应问题 ${row.problems.join('、')}</small></li>`).join('')}</ul></details>`:'';
   const past=state.history.filter(step=>step.supplement&&step.status==='completed');
-  return `<h4>本轮反馈汇总</h4><p class="dim" aria-live="polite">${status}</p>
+  return `<h4>本轮反馈汇总 <small>${autoText(state.model)}</small></h4><p class="dim" aria-live="polite">${status}</p>
     ${problems?`<ol>${problems.map(row=>`<li>${autoText(row.text)}${row.case_ids.length?` <small>${autoText(row.case_ids.map(caseName).join('、'))}</small>`:''}</li>`).join('')}</ol>`:''}
     ${problems&&!problems.length?'<p>这轮反馈没有指出具体问题。</p>':''}
     ${past.length?`<details><summary>查看补充记录</summary><ul>${past.map(step=>`<li>${autoText(step.supplement)}</li>`).join('')}</ul></details>`:''}
+    ${autoDiagnosisContent(latest?.result?.diagnosis)}
     ${details}
     ${!latest&&writable?button('start','生成问题清单',true):''}
     ${latest&&['failed','interrupted'].includes(latest.status)&&writable?button('retry','重试这一轮'):''}
     ${latest?.action==='summarize'&&latest.status==='completed'&&writable?`<form class="auto-refinement-form">
       <label>补充或纠正<textarea name="supplement" rows="2" maxlength="4000" required></textarea></label>
-      <button type="submit" class="btn small">提交补充</button>${button('confirm','确认问题并生成新版本',true)}</form>`:''}
+      <button type="submit" class="btn small">提交补充</button>${button('confirm',shared?'确认总结':'确认问题并生成新版本',true)}</form>`:''}
     ${version&&!state.run&&writable?`<p>要用这个版本重新评测原来的用例吗？</p>${button('rerun','确定用新版本重跑',true)}`:''}
     ${state.run?button('open-run',state.run.status==='completed'?'查看新评测报告':'查看重新评测进度',true):''}`;
 }
@@ -3432,8 +3657,18 @@ function autoRenderRefinement() {
   panel.innerHTML=content;
 }
 
+function autoShowFeedbackRefinement() {
+  const panel=document.querySelector('[data-auto-feedback-refinement]:not([hidden])');
+  if(!panel)return;
+  $('auto-feedback-dock')?.classList.remove('is-open');
+  $('auto-feedback-toggle')?.setAttribute('aria-expanded','false');
+  panel.scrollIntoView({block:'start'});
+  panel.focus({preventScroll:true});
+}
+
 async function autoRefreshRefinement(job, body) {
-  const result=await api(`${AUTO_API}/${route(job.id)}/feedback-refinement`,body);
+  const path=job.feedback_reviewer?'/api/shared-feedback-refinement':`${AUTO_API}/${route(job.id)}/feedback-refinement`;
+  const result=await api(path,body);
   if(autoState.job!==job)return;
   if(JSON.stringify(job.feedback_refinement)===JSON.stringify(result))return;
   job.feedback_refinement=result;
@@ -3485,6 +3720,234 @@ function autoRadarPanel(models,metrics,scores,scope) {
   </div>`;
 }
 
+function autoRecommendationPair(cases,winner,other,axis,skip) {
+  const contenders=cases.filter(item=>item.id!==skip&&item.leaders.includes(winner)
+    &&item.metric_scores?.[axis]?.[winner]>item.metric_scores[axis][other]);
+  const gap=item=>item.metric_scores[axis][winner]-item.metric_scores[axis][other];
+  contenders.sort((a,b)=>gap(b)-gap(a));
+  for(const item of contenders){
+    const input=autoState.job?.review_inputs?.[item.id];
+    for(const [index,shot] of Object.entries(input?.native_shots?.[winner]||{})){
+      const opposing=input.native_shots[other]?.[index];
+      const question=Object.values(shot.items||{}).find(check=>{
+        const rival=opposing?.items?.[check.id];
+        return check.axis===axis&&check.status==='pass'&&rival?.axis===axis&&rival.status==='fail'
+          &&check.evidence?.length&&rival.evidence?.length;
+      });
+      if(question)return {item,shotIndex:Number(index),winner,other,checks:[question,opposing.items[question.id]]};
+    }
+  }
+  return null;
+}
+
+function autoRecommendationExample(example,labels,framesPerModel) {
+  if(!example)return '';
+  const {item,shotIndex,winner,other,checks}=example;
+  const input=autoState.job?.review_inputs?.[item.id];
+  const title=item.name.split(' · ')[0];
+  const shot=input?.script_shots?.find(row=>row.index===shotIndex);
+  const buttonAttrs=`data-action="auto-recommendation-example" data-case-id="${autoText(item.id)}" data-shot-index="${shotIndex}"`;
+  const lightboxGroup='media-'+(++lightboxSerial);
+  const evidence=[winner,other].map((id,index)=>{
+    const check=checks[index];
+    const frames=check.evidence.slice().sort((a,b)=>a.actual_time_ms-b.actual_time_ms);
+    const points=framesPerModel===2&&frames.length>1?[frames[0],frames.at(-1)]:frames.slice(0,1);
+    const hasVideo=stepMediaURL(item.entries.find(row=>row.model_id===id)?.video);
+    const cut=input.shots?.[id]?.find(row=>row.index===input.shot_mapping?.[id]?.[shotIndex]);
+    const strip=points.map(point=>{
+      const image=stepMediaURL(point.asset),time=point.actual_time_ms;
+      const stamp=timeText(time),caption=labels[id]+' · '+stamp;
+      const end=cut?.end_ms>time?Math.min(time+2200,cut.end_ms):time+1200;
+      return `<div>
+        ${image?`<a href="${autoText(image)}" data-lightbox="${lightboxGroup}" data-caption="${autoText(caption)}"
+          aria-label="${autoText('放大 '+caption)}"><img src="${autoText(image)}" loading="lazy" alt="${autoText(caption)}"></a>`:''}
+        ${hasVideo&&Number.isFinite(time)?`<button type="button" class="auto-case-time" ${buttonAttrs}
+          data-model="${autoText(id)}" data-time="${time}" data-end-time="${end}"
+          aria-label="${autoText('播放 '+caption)}">${autoText(stamp)}</button>`:''}
+      </div>`;
+    }).join('');
+    const reason=check.reason.replace(/^违反[^。；：]{1,32}：/,'')
+      .replace(/^frame-\d+(?:\s*(?:至|到|~|–)\s*frame-\d+)?\s*(?:中|里)?[，、]?\s*/i,'')
+      .replace(/\bcord\s*\/\s*hose\b/gi,'电线/软管')
+      .replace(/，(?:属于原文明确禁止出现的 cord|未触犯其[他它]原文禁令)(?=。?$)/,'');
+    return `<figure><div class="auto-recommendation-strip">${strip}</div>
+      <figcaption><b>${autoText(labels[id])}</b> · ${autoText(reason)}</figcaption></figure>`;
+  }).join('');
+  return `<div class="auto-recommendation-example">
+    <div class="auto-recommendation-frames">${evidence}</div>
+    <button type="button" class="auto-case-time" ${buttonAttrs}>回看 ${autoText(title)}${shot?.title?' · '+autoText(shot.title):''}</button>
+  </div>`;
+}
+
+function autoReportOpening(report,labels,outcome,allCompared) {
+  const {leaders,case_wins:wins,metrics,cases,ranked_case_count:ranked}=report.comparison;
+  if(!wins||!leaders.length)return `<p class="auto-opening-summary">${outcome}</p>`;
+  const name=id=>autoText(labels[id]);
+  const names=ids=>ids.map(name).join('、');
+  const winner=leaders[0],count=wins[winner].total;
+  const others=Object.keys(wins).filter(id=>!leaders.includes(id));
+  const runnerCount=Math.max(0,...others.map(id=>wins[id].total));
+  const runners=others.filter(id=>wins[id].total===runnerCount);
+  const take=leaders.length>1?`<strong>${allCompared?'并列推荐':'暂并列推荐'} ${names(leaders)}。</strong> 各有 ${count} 条排在第一或并列第一。`:
+    `<strong>这批可以先用 ${name(winner)}。</strong> ${ranked} 条${ranked===report.matched_case_count?'':'已排名的'}测试里，它有 ${count} 条排在第一或并列第一${runners.length?`，${names(runners)} ${runners.length>1?'各有':'有'} ${runnerCount} 条`:''}。`;
+  const metricsCompared=leaders.length===1?metrics.flatMap(metric=>{
+    const score=metric.scores[winner];
+    const other=others.filter(id=>Number.isFinite(metric.scores[id])).sort((a,b)=>metric.scores[b]-metric.scores[a])[0];
+    return other&&Number.isFinite(score)&&metric.case_count?[{metric,other,score,gap:score-metric.scores[other]}]:[];
+  }).sort((a,b)=>b.gap-a.gap):[];
+  const strength=metricsCompared.find(row=>row.gap>0);
+  const tradeoff=metricsCompared.findLast(row=>row.gap<0);
+  const axisTitle={task_completion:'脚本里的动作做得更完整',physical_compliance:'更符合动作常识和脚本禁令'};
+  const axisName={task_completion:'任务完成度',physical_compliance:'物理与禁令检查'};
+  const metricName=metric=>autoText(axisName[metric.id]||autoRadarLabel(metric));
+  const summary=take+(runners.length&&count-runnerCount===1?'领先幅度只有一条。':'')
+    +(tradeoff?` ${metricName(tradeoff.metric)}这项，${name(tradeoff.other)} 的分更高（${autoRadarScore(tradeoff.metric.scores[tradeoff.other])} 对 ${autoRadarScore(tradeoff.score)}）。`:'');
+  if(!strength)return `<p class="auto-opening-summary">${summary}</p>`;
+  const first=autoRecommendationPair(cases,winner,strength.other,strength.metric.id);
+  const visual=cases.filter(item=>item.leaders.length===1&&item.leaders[0]===winner&&item.id!==first?.item.id
+    &&item.advantages[0]?.id==='physical_compliance'&&item.decisive_example).sort((a,b)=>b.advantages[0].gap-a.advantages[0].gap)[0];
+  const second=visual&&strength.metric.id!=='physical_compliance'
+    ?autoRecommendationPair([visual],winner,visual.decisive_example.model_id,'physical_compliance'):null;
+  const axis=strength.metric;
+  const headline=axisTitle[axis.id]||`${metricName(axis)}得分最高`;
+  const detail=`看同样的 ${axis.case_count} 条测试，${name(winner)} 的${metricName(axis)}平均 ${autoRadarScore(strength.score)} 分，${name(strength.other)} 平均 ${autoRadarScore(axis.scores[strength.other])} 分。`;
+  const exampleTitle=example=>autoText(autoState.job?.review_inputs?.[example.item.id]?.script_shots?.find(row=>row.index===example.shotIndex)?.title||`第 ${example.shotIndex} 镜`);
+  return `<p class="auto-opening-summary">${summary}</p>
+    <section class="auto-recommendation" aria-labelledby="auto-recommendation-title">
+      <h3 id="auto-recommendation-title">推荐理由</h3>
+      <div class="auto-recommendation-row"><div>
+        <h4>${headline}</h4><p>${detail}</p>
+        ${first?`<p>${autoText(first.item.name.split(' · ')[0])} · ${exampleTitle(first)}</p>`:''}
+      </div>${autoRecommendationExample(first,labels,2)}</div>
+      ${second?`<div class="auto-recommendation-row"><div>
+        <h4>同一镜里，脚本禁令执行得更好</h4>
+        <p>${autoText(second.item.name.split(' · ')[0])} · ${exampleTitle(second)}。</p>
+      </div>${autoRecommendationExample(second,labels,1)}</div>`:''}
+    </section>`;
+}
+
+const deliveryNames={ready:'画面通过',rework:'要返工',blocked:'无法交付',review:'待复核',missing:'未提供成片'};
+
+function autoDeliveryIssue(issue,labels,cases) {
+  const {example,model_id:model}=issue;
+  const id=example.case_id;
+  const title=cases.find(row=>row.id===id)?.name.split(' · ')[0]||id;
+  const input=autoState.job?.review_inputs?.[id];
+  const index=example.shot_index;
+  const shot=input?.script_shots?.find(row=>row.index===index);
+  const cut=input?.shots?.[model]?.find(row=>row.index===input.shot_mapping?.[model]?.[index]);
+  const attrs=`data-action="auto-recommendation-example" data-case-id="${autoText(id)}" data-shot-index="${index}"`;
+  const group='media-'+(++lightboxSerial);
+  const frames=example.frames.map(point=>{
+    const url=stepMediaURL(point.asset),time=point.actual_time_ms;
+    const end=cut?.end_ms>time?Math.min(time+2200,cut.end_ms):time+1200;
+    const label=timeText(time);
+    return `<figure>${url?`<a href="${autoText(url)}" data-lightbox="${group}" data-caption="${autoText(label)}">
+      <img src="${autoText(url)}" loading="lazy" alt="${autoText(`${title} ${labels[model]} ${label}`)}"></a>`:''}
+      <figcaption><button type="button" class="auto-case-time" ${attrs} data-model="${autoText(model)}"
+        data-time="${time}" data-end-time="${end}">${autoText(label)}</button></figcaption></figure>`;
+  }).join('');
+  const scenes=Object.entries(issue.scenes).map(([scene,count])=>`${scene} ${count} 条`).join('、');
+  const reason=example.reason.replace(/\bframe-(\d+)\b/gi,'第 $1 张抽帧');
+  return `<article class="auto-delivery-issue">
+    <div><h4>${autoText(labels[model])} · ${autoText(issue.topic)}</h4>
+      <p class="auto-delivery-note">${issue.count} 条有此类问题 · ${autoText(scenes)}</p>
+      <p>${autoText(reason)}</p>
+      <button type="button" class="auto-case-time" ${attrs}>回看 ${autoText(title)}${shot?.title?' · '+autoText(shot.title):''}</button>
+    </div>${frames?`<div class="auto-delivery-frames">${frames}</div>`:''}
+  </article>`;
+}
+
+function autoDeliveryOpening(report,labels,cases) {
+  const {delivery,comparison}=report;
+  const models=Object.keys(delivery.counts);
+  const names=ids=>autoText(ids.map(id=>labels[id]).join('、'));
+  const wins=comparison.case_wins;
+  const leaders=comparison.leaders||[];
+  const pick=wins&&leaders.length===1&&comparison.ranked_case_count===delivery.case_count?leaders[0]:null;
+  const total=delivery.case_count;
+  const action=comparison.metrics.find(metric=>metric.id==='task_completion'&&metric.case_count===total);
+  const bestAction=action&&pick&&models.every(id=>Number.isFinite(action.scores[id])&&
+    (id===pick||action.scores[pick]>action.scores[id]));
+  const summary=pick?`这批片子优先试 ${names([pick])}。`:'这批片子还挑不出唯一的首选。';
+  const runners=pick?models.filter(id=>id!==pick).sort((a,b)=>wins[b].total-wins[a].total):[];
+  const nearest=runners.filter(id=>wins[id].total===wins[runners[0]].total);
+  const comparisonText=pick?`同样的 ${total} 条脚本，${names([pick])} 有 ${wins[pick].total} 条排第一，其中 ${wins[pick].tied} 条是并列。${nearest.length?`${names(nearest)}${nearest.length>1?'各':''}有 ${wins[nearest[0]].total} 条排第一。`:''}`:
+    `这次有 ${comparison.ranked_case_count??0} 条能排出名次，共测了 ${total} 条。`;
+  const records=Object.values(report.person_realism_cases||{});
+  const reasons=models.map(id=>{
+    const issues=delivery.issues.filter(issue=>issue.model_id===id);
+    const weak=records.filter(row=>row.consensus?.overall?.status==='stable'&&row.consensus.overall.weakest.includes(id));
+    const examples=weak.flatMap(row=>{
+      const frame=row.evidence?.find(point=>point.model_id===id&&point.reason&&point.dimension==='skin');
+      return frame?[{...frame,case_id:row.case_id}]:[];
+    });
+    const issue=issues.find(item=>item.topic==='脚本中的动作或结果没做到');
+    const paragraphs=[];
+    if(weak.length>=2){
+      paragraphs.push(`有 ${weak.length} 条，两轮对比都把它的人物排在最不像实拍的一档。`);
+      if(examples.length){
+        const frame=examples[0], name=cases.find(item=>item.id===frame.case_id)?.name.split(' · ')[0]||frame.case_id;
+        const url=stepMediaURL(frame.asset);
+        paragraphs.push(`例如 ${autoText(name)}，${autoText(frame.reason)} ${url?`<a href="${autoText(url)}" data-lightbox="realism-${++lightboxSerial}" data-caption="${autoText(name)}">看 ${autoText(timeText(frame.time_ms))} 的画面</a>`:''}`);
+      }
+    }
+    if(issue)paragraphs.push(`${total} 条里有 ${issue.count} 条漏了脚本要求的动作，或没拍出要求的结果。`);
+    if(!paragraphs.length)paragraphs.push('已有记录还说不清它反复在哪里出错。');
+    // 频次属于整个问题类别，具体画面只作单条例子。
+    const example=weak.length>=2?null:issues.find(item=>item.topic==='物理异常、跳变或画面崩坏'&&item.count>=2)||issue;
+    if(example){
+      if(example!==issue)paragraphs.push(`画面上，有 ${example.count} 条出现了画面跳变或物体变形。`);
+      const row=example.example;
+      const title=cases.find(item=>item.id===row.case_id)?.name.split(' · ')[0]||row.case_id;
+      const clip=row.frames[0];
+      paragraphs.push(`例如 ${autoText(title)}，${autoText(row.reason.split(/[；;]/,1)[0].replace(/frame-(\d+)/gi,'第$1帧').replace(/[。.]?$/,'。'))}
+        <button type="button" class="auto-case-time" data-action="auto-recommendation-example" data-case-id="${autoText(row.case_id)}"
+        data-shot-index="${row.shot_index}" data-model="${autoText(id)}"${clip?` data-time="${clip.actual_time_ms}" data-end-time="${clip.actual_time_ms+1500}"`:''}>回看这段</button>`);
+    }
+    return `<article class="auto-delivery-issue auto-model-story"><div><h4>${names([id])}</h4><p>${paragraphs.join(' ')}</p></div></article>`;
+  });
+  const statusKeys=Object.keys(deliveryNames);
+  const totals=autoTable(['模型',...Object.values(deliveryNames)],models.map(id=>[
+    names([id]),...statusKeys.map(key=>delivery.counts[id][key]),
+  ]));
+  const byScene=autoTable(['场景',...models.map(id=>labels[id]),'怎么选'],delivery.scenes.map(scene=>[
+    `${autoText(scene.name)} · ${scene.case_count} 条`,
+    ...models.map(id=>`${scene.counts[id].ready}/${scene.case_count}`),
+    scene.leaders.length===0?'这批还没有画面全过的成片':scene.leaders.length===1?`${names(scene.leaders)}通过最多`:'通过数并列',
+  ]));
+  const shown=new Set();
+  const highlights=delivery.issues.filter(issue=>{
+    if(shown.has(issue.model_id))return false;
+    shown.add(issue.model_id);
+    return true;
+  });
+  const more=delivery.issues.filter(issue=>!highlights.includes(issue));
+  const renderIssue=issue=>autoDeliveryIssue(issue,labels,cases);
+  return `<h3>这个任务选谁</h3><p class="auto-opening-summary"><strong>${summary}</strong>
+    ${bestAction?`它照脚本做动作的得分最高（${autoRadarScore(action.scores[pick])}/10）。`:''}</p>
+    <p>${comparisonText}</p>
+    ${pick?`<p>真要直接用，${names([pick])} 的 ${total} 条里有 ${delivery.counts[pick].ready} 条通过了全部画面检查。台词还要另听。</p>`:''}
+    <section class="auto-delivery-section"><h3>这几家分别用起来有什么差别</h3>${reasons.join('')}</section>
+    <details class="auto-delivery-more"><summary>查看各场景的条数和扣分画面</summary>
+    <section class="auto-delivery-section"><h3>成片一览</h3>${totals}</section>
+    <section class="auto-delivery-section"><h3>不同场景怎么选</h3>
+      <p class="auto-delivery-note">表里是通过画面检查的条数。样本少的场景只看本批表现。</p>${byScene}</section>
+    ${highlights.length?`<section class="auto-delivery-section"><h3>最影响使用的问题</h3>
+      ${highlights.map(renderIssue).join('')}
+      ${more.length?`<details class="auto-delivery-more"><summary>查看各模型的其他问题</summary>${more.map(renderIssue).join('')}</details>`:''}
+    </section>`:''}</details>`;
+}
+
+function autoProductCaseVerdict(rows,labels) {
+  const ready=rows.filter(row=>row.status==='能用').map(row=>labels[row.model_id]);
+  const title=ready.length?'可以直接用的有'+ready.join('、'):'这条用例没有能直接用的成片';
+  return `<section class="auto-case-verdict auto-product-case"><h4>${autoText(title)}</h4>
+    <ul>${rows.map(row=>`<li><strong>${autoText(labels[row.model_id])}</strong>
+      <b class="${row.status==='能用'?'pass':'fail'}">${autoText(row.status)}</b>
+      <p>${autoText(row.reason)}</p></li>`).join('')}</ul></section>`;
+}
+
 function autoReportOverview(report) {
   const comparison=report.comparison;
   const shotBased=report.schema_version==='video-evaluation-report/2';
@@ -3502,17 +3965,15 @@ function autoReportOverview(report) {
   const outcome=!best.length?'目前没有足够的共同检查可用来排出名次。':counts?
     `在 ${comparison.ranked_case_count} 条已排名用例中，<strong>${names(best)} ${winner}</strong>，${best.length>1?'各获':'共获'} ${counts[best[0]].total} 次第一。`:
     `${names(best)}的整批综合均分最高（${format(comparison.scores[best[0]])} 分）。`;
-  const ranking=counts?[...report.models].sort((a,b)=>counts[b.id].total-counts[a.id].total)
-    .map(model=>{
-      const wins=counts[model.id];
-      return `<li class="auto-win-card${best.includes(model.id)?' is-leading':''}">
-        <span>${autoText(labels[model.id])}</span><strong>${wins.total} 次第一</strong>
-        <small>单独第一 ${wins.outright} 次 · 并列第一 ${wins.tied} 次</small></li>`;
-    }).join(''):'';
+  const ranking=counts?autoTable(['模型','第一次数','单独第一','并列第一'],
+    [...report.models].sort((a,b)=>counts[b.id].total-counts[a.id].total).map(({id})=>[
+      autoText(labels[id]),counts[id].total,counts[id].outright,counts[id].tied,
+    ])):'';
   const table=autoTable(['模型',...comparison.metrics.map(autoRadarLabel)],
     report.models.map(model=>[autoText(labels[model.id]),...comparison.metrics.map(metric=>
       `<b>${format(metric.scores[model.id])}</b><small>${metric.case_count? `比了 ${metric.case_count} 条测试`:'待复核'} </small>`)]));
   const modelSuffix=new RegExp(` · (?:${Object.values(labels).map(name=>name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|')})$`);
+  const delivery=report.delivery;
   const cases=comparison.cases.map(item=>{
     const heading=item.name.replace(modelSuffix,'');
     const task=item.task_checks;
@@ -3540,9 +4001,14 @@ function autoReportOverview(report) {
     const radar=autoRadarPanel(report.models,autoRadarMetrics(comparison,item),
       Object.fromEntries(item.entries.map(entry=>[entry.model_id,entry.score])),item.id);
     const realism=report.person_realism_cases?.[item.id]||(report.person_realism?.case_id===item.id?report.person_realism:null);
+    const deliveryRows=delivery?.cases.filter(row=>row.case_id===item.id);
+    const reviewed=autoState.job?.product_case_decisions?.[item.id];
     return {id:item.id,heading,body:`
+      ${reviewed?autoProductCaseVerdict(reviewed,labels)+'<details class="auto-report-source"><summary>查看复审前的评分与排名</summary>':''}
       <section class="auto-case-verdict${radar?' has-radar':''}">
         <div><h4>${verdict}</h4>
+          ${deliveryRows?.length?`<ul class="auto-case-delivery">${deliveryRows.map(row=>
+            `<li>${autoText(labels[row.model_id])} · <b data-status="${autoText(row.status)}">${autoText(deliveryNames[row.status])}</b></li>`).join('')}</ul>`:''}
           ${severeLine}${severe?exampleText:''}
           ${(!(severe||hasCritical)&&reason)||checks||item.metric_count!==comparison.metrics.length?`<p>${severe||hasCritical?'':reason}${checks}${item.metric_count!==comparison.metrics.length?`已有 ${item.metric_count}/${comparison.metrics.length} 项指标可比较。`:''}</p>`:''}
           ${critical}${severe?'':exampleText}
@@ -3551,6 +4017,7 @@ function autoReportOverview(report) {
         ${radar?`<div class="auto-case-scores"><h4>本用例各项得分</h4>${radar}</div>`:''}
       </section>
       ${realism?autoPersonRealism(realism,labels,item.realism_ranking):''}
+      ${reviewed?'</details>':''}
       ${autoCaseInputs(item.id)}
       ${autoCaseVideos(item.id,videos)}`};
   });
@@ -3560,24 +4027,22 @@ function autoReportOverview(report) {
     return name+' · '+shots.map(index=>'第 '+index+' 镜').join('、');
   });
   return `<article class="automatic-report auto-overview">
-    <header class="auto-overview-head">
+    <header class="auto-overview-head auto-reading-head">
       <p class="auto-report-scope"><span>${report.models.length} 组模型</span><span>同一批 ${report.matched_case_count} 条测试</span></p>
       <h2>${autoText(report.title)}</h2>
       ${window.STATIC_SNAPSHOT?.feedback_url?'<a class="btn small primary" data-auto-feedback-link target="_blank" rel="noopener noreferrer">填写本条反馈</a>':''}
+      ${!autoState.job?.product_case_decisions&&!window.STATIC_SNAPSHOT?(autoState.job?.impact_versions||[]).map(v=>`<a class="btn small" href="/review-versions/${encodeURIComponent(v)}/${encodeURIComponent(autoState.job.id)}">成片复查${v.endsWith('-pair')?' · 指定视频':''}</a>`).join(''):''}
+      ${!autoState.job?.product_case_decisions&&autoState.job?.impact_review&&!window.STATIC_SNAPSHOT?`<a class="btn small" href="/review-versions/impact-v2/${encodeURIComponent(autoState.job.id)}">看新版 · 这些片子能不能用</a>`:''}
       ${autoState.job?.pilot_preview?'<a class="btn small" href="/review-versions/V1" target="_blank" rel="noopener">查看 V1 输入预览</a>':''}
-      ${revised.length?`<p class="callout">本版复评 ${autoText(revised.join('；'))}。其余分镜沿用原报告。</p>`:''}
-      ${revised.length&&report.shot_summary?`<p class="auto-conclusion">${autoText(report.shot_summary)}</p>`:''}
-      <p class="auto-conclusion">${outcome}</p>
-      ${ranking?`<ul class="auto-win-grid" aria-label="各模型获得第一的次数">${ranking}</ul>
-        <small>单独第一和并列第一各计 1 次。${comparison.ranked_case_count<report.matched_case_count?` 有 ${report.matched_case_count-comparison.ranked_case_count} 条用例暂未排名。`:''}</small>`:''}
-      <h3>整批各项均分</h3>
-      <ul class="auto-metric-tags" aria-label="评测指标">${comparison.metrics.map(metric=>`<li>${autoText(autoRadarLabel(metric))}</li>`).join('')}</ul>
-      ${shotBased&&!revised.length&&report.shot_summary?`<p>${autoText(report.shot_summary)}</p>`:''}
-      ${autoRadarPanel(report.models,graded,comparison.scores,'overall')}
+      ${!autoState.job?.product_case_decisions&&revised.length?`<p class="callout">本版复评 ${autoText(revised.join('；'))}。其余分镜沿用原报告。</p>`:''}
+      ${autoState.job?.designer_opening || (delivery?autoDeliveryOpening(report,labels,comparison.cases):autoReportOpening(report,labels,outcome,allCompared))}
     </header>
-    <section class="auto-case-list"><h3>逐条测试对比</h3>${autoFeedbackSummary()}
-      <section class="auto-feedback-refinement" data-auto-feedback-refinement hidden></section>${autoCasePager(cases)}</section>
-    <details class="auto-report-source"><summary>查看各项分数和用到的测试</summary>
+    <section class="auto-case-list"><h3>${autoState.job?.product_case_decisions?'逐条用例分析':'逐条测试对比'}</h3>${autoFeedbackSummary()}
+      <section class="auto-feedback-refinement" data-auto-feedback-refinement tabindex="-1" hidden></section>${autoCasePager(cases)}</section>
+    <details class="auto-report-source auto-overall-results"><summary>${autoState.job?.product_case_decisions?'复审前的整批排名与评分':'整批排名与评分'}</summary>
+      ${ranking?`<p>单独第一和并列第一各计 1 次。${comparison.ranked_case_count<report.matched_case_count?` 有 ${report.matched_case_count-comparison.ranked_case_count} 条用例暂未排名。`:''}</p>${ranking}`:''}
+      ${autoRadarPanel(report.models,graded,comparison.scores,'overall')}
+      ${shotBased&&report.shot_summary?`<p>${autoText(report.shot_summary)}</p>`:''}
       <p>各模型在每条用例上用同一批可判断的检查打分。表内每一列是该指标的用例均分。</p>
       ${table}
       ${supplement?`<p>补评使用 ${autoText(supplement.judge_model)}，有 ${supplement.case_metrics_adopted} 项测试指标采用了补评结果。</p>`:''}
@@ -3745,6 +4210,8 @@ function autoShowCase(id,focus=false) {
   const index=Math.max(0,pages.findIndex(page=>page.dataset.autoCasePage===id));
   const current=pages[index];
   if(!current)return;
+  const previous=pages.find(page=>!page.hidden);
+  if(previous&&previous!==current)autoScheduleFeedbackSave(autoState.job,previous.dataset.autoCasePage,0);
   autoShotTooltip(null);
   autoCloseFinding();
   for(const page of pages){
@@ -4186,8 +4653,7 @@ async function autoPlayClips(page,starts,{muted=false,missing=0}={}) {
     starts.length>playing?`${starts.length-playing} 组未播放`:''].filter(Boolean).join(' · ');
 }
 
-function playAutoEvidence(button) {
-  const page=button.closest('[data-auto-case-page]');
+function playAutoEvidence(button,page=button.closest('[data-auto-case-page]')) {
   const video=page.querySelector(`[data-auto-video-model="${CSS.escape(button.dataset.model)}"] video`);
   if(!video)return;
   if(button.dataset.sound==='1')video.muted=false;
@@ -4358,7 +4824,7 @@ function autoAudit(job) {
     ${traces.length?`<h3>实际调用记录</h3><label>选择调用记录<select id="auto-trace-select">${traces.map(id=>`<option value="${autoText(id)}">${autoText(autoTraceLabel(id,job))}</option>`).join('')}</select></label><button class="btn small" data-action="auto-show-trace">查看请求、参数、提示词和返回</button><div id="auto-trace" class="auto-trace-panel"></div>`:''}
     ${job.status==='completed'&&flow?.shot_parameters&&!flow.repair_from&&audit.problems.some(row=>['standards','shot_batch','shot_video','audio'].includes(row.stage))?
       '<button type="button" class="btn small" data-action="auto-retry-shots">补评缺失分镜</button>':''}
-    ${audit.problems.length?`<details class="block"><summary>执行中记录的问题（${audit.problems.length}）</summary>${autoBullets(audit.problems.map(row=>`${row.entry} · ${row.error.code} · ${row.error.message}`))}</details>`:''}
+    ${audit.problems.length?`<details class="block" data-auto-details-key="audit-problems"><summary>执行中记录的问题（${audit.problems.length}）</summary>${autoBullets(audit.problems.map(row=>`${row.entry} · ${row.error.code} · ${row.error.message}`))}</details>`:''}
     ${guests}
     </section>`;
 }
@@ -4370,13 +4836,70 @@ function autoSharedFeedbackAudit(job) {
   const modelNames=Object.fromEntries(job.groups.map(row=>[row.id,autoShortModel(row.name)]));
   return `<section class="auto-shared-feedback-audit"><h3>内网设计师反馈</h3>${guests.map(guest=>{
     const feedback=guest.feedback;
-    return `<details class="block"><summary>${autoText(guest.name)} · 已填写 ${feedback.reviewed}/${feedback.total} 条</summary>
+    return `<details class="block" data-auto-details-key="reviewer-${autoText(guest.id)}"><summary>${autoText(guest.name)} · 已填写 ${feedback.reviewed}/${feedback.total} 条</summary>
+      ${guest.confirmed_summary?`<section><h4>已确认的反馈总结</h4>${guest.confirmed_summary.problems.length?
+        `<ul>${guest.confirmed_summary.problems.map(row=>`<li>${autoText(row.text)}${row.case_ids.length?
+          ` <small>${autoText(row.case_ids.map(id=>caseNames[id]||id).join('、'))}</small>`:''}</li>`).join('')}</ul>`:
+        '<p>这轮反馈没有指出具体问题。</p>'}
+        <div data-shared-feedback-version="${autoText(guest.id)}">${autoSharedVersionContent(guest.version_generation,guest.id)}</div></section>`:
+        '<p class="dim">设计师填齐并确认总结后，可生成提示词版本。</p>'}
+      ${guest.adopted_version&&(!guest.confirmed_summary||guest.adopted_version.latest)?
+        `<div data-adopted-feedback-version="${autoText(guest.id)}">${autoSharedVersionContent(guest.adopted_version,guest.id,true)}</div>`:''}
       ${Object.entries(feedback.records).map(([id,record])=>`<section class="auto-shared-feedback-record"><h4>${autoText(caseNames[id]||id)}</h4>
         ${record.recommendation_agrees===true?'<p>同意系统推荐</p>':record.recommendation_agrees===false?`<p>设计师推荐 ${autoText(record.preferred_models.map(id=>modelNames[id]||id).join('、'))}</p>
         <p>${autoText(record.recommendation_reason)}</p>`:''}
-        ${record.observations?`<p>${autoText(record.observations)}</p>`:''}</section>`).join('')||'<p class="dim">尚未保存用例反馈。</p>'}</details>`;
+        ${record.observations?`<p>${autoText(record.observations)}</p>`:''}
+        ${autoFeedbackImageList(record.images||[])}</section>`).join('')||'<p class="dim">尚未保存用例反馈。</p>'}</details>`;
   }).join('')}</section>`;
 }
+
+function autoSharedVersionContent(state,reviewerId,adopted=false) {
+  const latest=state.latest;
+  const version=latest?.result?.version;
+  const model=autoText(state.model);
+  const cases=autoState.job?.result?.report?.comparison?.cases||[];
+  const caseName=id=>cases.find(row=>row.id===id)?.name||id;
+  const button=(label,step='')=>`<button class="btn small primary" type="button" data-action="auto-generate-shared-version"
+    data-reviewer="${autoText(reviewerId)}" data-version-step="${step}">${label}</button>`;
+  if(adopted&&!latest)return button('以当前已保存反馈开始总结','adopt');
+  const source=adopted?`<p class="dim">维护员采用已保存的 ${state.source.reviewed}/${state.source.total} 条反馈。</p>`:'';
+  const summary=adopted&&state.summary?`<details ${latest.action==='summarize'?'open':''}><summary>查看系统生成的反馈总结</summary>
+    <ul>${state.summary.problems.map(problem=>`<li>${autoText(problem.text)}</li>`).join('')}</ul></details>`:'';
+  const answers=latest?.result?.diagnosis||[];
+  const diagnosis=autoDiagnosisContent(answers);
+  const reply=(label)=>`<form class="auto-refinement-form" data-adopted-feedback-reply="${autoText(reviewerId)}">
+    <label>${label}<textarea name="supplement" rows="2" maxlength="4000" required></textarea></label>
+    <button type="submit" class="btn small">更新问题清单</button></form>`;
+  const followup=adopted&&answers.some(row=>row.decision==='clarify')?reply('补充待确认的用例、模型或时间点'):'';
+  const reanalyze=adopted&&latest?.action==='optimize'&&latest.status==='completed'?button('重新诊断已保存的反馈','reanalyze'):'';
+  if(!latest)return `<p class="dim">使用 ${model} 根据已确认的总结生成提示词版本。</p>${button('生成提示词版本')}`;
+  if(['queued','running'].includes(latest.status))return `${source}${summary}<p role="status">${model} 正在${latest.action==='summarize'?'整理反馈':'生成提示词版本'}…</p>`;
+  if(['failed','interrupted'].includes(latest.status))return `${source}${summary}<p class="error">${autoText(latest.error?.message||'处理反馈失败。')}</p>${button('重试',adopted?'retry':'')}`;
+  if(adopted&&latest.action==='summarize')return `${source}${summary}${reply('补充或纠正总结')}${button('采用总结并生成提示词版本','generate')}`;
+  if(!version)return `${source}${summary}${diagnosis}<p>系统检查完毕，本轮没有可落实到提示词的改动。</p>${followup}${reanalyze}`;
+  const instructions=version.changes.instructions.map(row=>
+    `<li><b>${autoText(autoShotMetricNames[row.axis]||row.axis)} · 系统提示词</b> ${autoText(row.text)}
+      ${row.case_ids?`<small>适用用例 ${autoText(row.case_ids.map(caseName).join('、'))}${row.shot?` · 第 ${row.shot} 镜`:''}</small>`:''}</li>`);
+  const questions=version.changes.questions.map(row=>
+    `<li><b>${autoText(caseName(row.case_id))} · 第 ${row.shot} 镜 · ${row.question_id?'改写判断题':'新增判断题'}</b> ${autoText(row.text)}</li>`);
+  return `${source}${summary}${diagnosis}${followup}<section><h4>系统生成的提示词版本 ${autoText(version.name)}</h4>
+    <p class="dim">生成模型 ${model} · 来源流程 ${autoText(version.source_flow)}</p>
+    <ul>${[...instructions,...questions].join('')}</ul>${reanalyze}</section>`;
+}
+
+async function autoRefreshSharedVersion(job,guest,generate=false,adopted=false,step='',supplement) {
+  const endpoint=adopted?'shared-feedback-adoption':'shared-feedback-version';
+  const path=`${AUTO_API}/${route(job.id)}/${endpoint}/${route(guest.id)}`;
+  const body=adopted&&step?(['adopt','reanalyze'].includes(step)?{action:step}:{action:step,parent:guest.adopted_version.latest.id}):generate?{}:undefined;
+  if(step==='revise')body.supplement=supplement;
+  const state=await api(path,body);
+  if(autoState.job!==job)return;
+  guest[adopted?'adopted_version':'version_generation']=state;
+  const attribute=adopted?'data-adopted-feedback-version':'data-shared-feedback-version';
+  const panel=$('auto-result').querySelector(`[${attribute}="${CSS.escape(guest.id)}"]`);
+  if(panel)panel.innerHTML=autoSharedVersionContent(state,guest.id,adopted);
+}
+
 function autoTraceView(trace) {
   const excerpt=(title,value)=>value==null?'':promptBox(title,typeof value==='string'?value:JSON.stringify(value,null,2));
   const raw=`<details class="block"><summary>展开完整调用记录</summary><pre class="prompt-text auto-trace">${autoText(JSON.stringify(trace,null,2))}</pre></details>`;
@@ -4481,6 +5004,7 @@ function autoRender(job,caseId=null) {
   });
   autoShowCase(caseId||read('automatic-case:'+job.id)||Object.keys(job.result?.report?.recheck_shots||{})[0],Boolean(caseId));
   autoRenderRefinement();
+  autoRestoreFeedbackDrafts(job);
   requestAnimationFrame(drawAutoRadar);
 }
 async function autoPoll() {
@@ -4489,15 +5013,24 @@ async function autoPoll() {
   if(!job)return;
   if(!['queued','running'].includes(job.status)){
     const refinement=job.feedback_refinement;
-    if(!autoState.refinementPolling&&[refinement?.history.at(-1)?.status,refinement?.run?.status].some(status=>['queued','running'].includes(status))){
+    const isPending=status=>['queued','running'].includes(status);
+    const versions=(job.audit?.shared_feedback||[]).filter(guest=>isPending(guest.version_generation?.latest?.status));
+    const adopted=(job.audit?.shared_feedback||[]).filter(guest=>isPending(guest.adopted_version?.latest?.status));
+    const personal=[refinement?.history.at(-1)?.status,refinement?.run?.status].some(isPending);
+    if(!autoState.refinementPolling&&(personal||versions.length||adopted.length)){
       autoState.refinementPolling=true;
-      try {await autoRefreshRefinement(job);} catch(e) {if(e.status===401)await autoSession();}
+      try {
+        if(personal)await autoRefreshRefinement(job);
+        await Promise.all([...versions.map(guest=>autoRefreshSharedVersion(job,guest)),
+          ...adopted.map(guest=>autoRefreshSharedVersion(job,guest,false,true))]);
+      }
+      catch(e) {if(e.status===401)await (job.feedback_reviewer?initAutomaticReportShare():autoSession());}
       finally {autoState.refinementPolling=false;}
     }
     return;
   }
   autoState.polling=true;
-  try {await autoOpen(autoState.selected);await autoList();}
+  try {if(await autoOpen(job.id,{poll:true}))await autoList();}
   catch(e) {if(e.status===401)await autoSession();}
   finally {autoState.polling=false;}
 }
@@ -4555,10 +5088,23 @@ $('auto-import').addEventListener('click',e=>busy(e.currentTarget,async()=>{
 }));
 $('page-automatic-evaluation').addEventListener('change',e=>{
   if(e.target.matches('[data-auto-case-select]'))autoShowCase(e.target.value,true);
+  if(e.target.matches('[data-auto-feedback-image-input]')){
+    const files=[...e.target.files];
+    e.target.value='';
+    if(files.length)autoAttachFeedbackImages(e.target.form,files);
+  }
+});
+$('page-automatic-evaluation').addEventListener('paste',e=>{
+  const form=e.target.closest('.auto-feedback-form');
+  if(!form)return;
+  const images=[...e.clipboardData.files].filter(file=>file.type.startsWith('image/'));
+  if(!images.length)return;
+  e.preventDefault();
+  autoAttachFeedbackImages(form,images);
 });
 $('page-automatic-evaluation').addEventListener('input',e=>{
   const form=e.target.closest('.auto-feedback-form');
-  if(!form)return;
+  if(!form||e.target.type==='file')return;
   const box=form.closest('[data-auto-feedback-case]');
   const values=autoFeedbackValues(form);
   if(e.target.name==='recommendation'){
@@ -4566,7 +5112,7 @@ $('page-automatic-evaluation').addEventListener('input',e=>{
     details.hidden=details.disabled=values.recommendation_agrees!==false;
   }
   saved(autoFeedbackDraftKey(autoState.job,box.dataset.autoFeedbackCase),values);
-  box.querySelector('[data-auto-feedback-status]').textContent='草稿未提交';
+  autoScheduleFeedbackSave(autoState.job,box.dataset.autoFeedbackCase);
 });
 for(const event of ['pointerover','focusin']){
   $('auto-result').addEventListener(event,e=>{
@@ -4621,44 +5167,59 @@ $('page-automatic-evaluation').addEventListener('submit',e=>{
   if(e.target.matches('.auto-refinement-form')){
     e.preventDefault();
     const supplement=e.target.elements.supplement.value.trim();
+    if(e.target.dataset.adoptedFeedbackReply){
+      const job=autoState.job;
+      const guest=job.audit.shared_feedback.find(row=>row.id===e.target.dataset.adoptedFeedbackReply);
+      if(guest&&supplement)busy(e.submitter,()=>autoRefreshSharedVersion(job,guest,false,true,'revise',supplement));
+      return;
+    }
     if(supplement)busy(e.submitter,()=>autoRefinementAction('revise',supplement));
     return;
   }
   if(!e.target.matches('.auto-feedback-form'))return;
   e.preventDefault();
-  const form=e.target, box=form.closest('[data-auto-feedback-case]');
-  const values=autoFeedbackValues(form);
-  values.observations=values.observations.trim();
-  if(values.recommendation_agrees===false){
-    if(!values.preferred_models.length){
-      notice('请至少选择一个你认为最好的模型。','error');
-      form.querySelector('input[name="model"]')?.focus();
-      return;
-    }
-    values.recommendation_reason=values.recommendation_reason.trim();
-    if(!values.recommendation_reason){notice('请填写推荐理由。','error');form.elements.recommendation_reason.focus();return;}
-  } else {
-    values.preferred_models=[];
-    values.recommendation_reason='';
-  }
-  const existing=autoState.job.feedback.records[box.dataset.autoFeedbackCase];
-  if(values.recommendation_agrees===null&&!values.observations&&!existing){
-    notice('请核对推荐结果，或填写其他观察。','error');
-    return;
-  }
-  busy(e.submitter,()=>autoFeedbackSave(box,values));
 });
 $('page-automatic-evaluation').addEventListener('click',e=>{
   const button=e.target.closest('button[data-action]');
   if(!button)return;
   const action=button.dataset.action;
+  if(action==='auto-retry-feedback-save'){
+    autoScheduleFeedbackSave(autoState.job,button.closest('[data-auto-feedback-case]').dataset.autoFeedbackCase,0);
+    return;
+  }
+  if(action==='auto-generate-shared-version'){
+    const job=autoState.job;
+    const guest=job.audit.shared_feedback.find(item=>item.id===button.dataset.reviewer);
+    const step=button.dataset.versionStep;
+    if(guest)busy(button,()=>autoRefreshSharedVersion(job,guest,!step,Boolean(step),step));
+    return;
+  }
+  if(action==='auto-remove-feedback-image'){
+    const form=button.closest('.auto-feedback-form');
+    const caseId=form.closest('[data-auto-feedback-case]').dataset.autoFeedbackCase;
+    autoUpdateFeedbackImages(form,autoFeedbackImages(autoState.job,caseId).filter((_,i)=>i!==Number(button.dataset.index)));
+    return;
+  }
   if(action.startsWith('auto-refinement-')){
+    if(action==='auto-refinement-view'){
+      autoShowFeedbackRefinement();
+      if(!autoState.job.feedback_refinement.history.length)busy(button,()=>autoRefinementAction('start'));
+      return;
+    }
     busy(button,()=>autoRefinementAction(action.slice('auto-refinement-'.length)));
     return;
   }
   if(action==='auto-open')busy(button,()=>autoOpen(button.dataset.id));
   if(action==='auto-case-play'||action==='auto-case-sync')autoShotTooltip(null);
   if(action==='auto-case-play')playAutoEvidence(button);
+  if(action==='auto-recommendation-example'){
+    const page=autoCasePages().find(row=>row.dataset.autoCasePage===button.dataset.caseId);
+    if(!page)return;
+    autoShowCase(button.dataset.caseId,true);
+    const shot=page.querySelector(`[data-auto-shot-choice][data-shot-index="${CSS.escape(button.dataset.shotIndex)}"]`);
+    if(shot)autoSelectShot(page,shot);
+    if(button.dataset.time)playAutoEvidence(button,page);
+  }
   if(action==='auto-case-step'){
     const pages=autoCasePages();
     const next=pages[pages.findIndex(page=>!page.hidden)+Number(button.dataset.step)];
@@ -4712,16 +5273,32 @@ $('page-automatic-evaluation').addEventListener('click',e=>{
     await autoOpen(job.id); await autoList();
   });
   if(action==='auto-show-trace')busy(button,async()=>{
+    const jobId=autoState.selected;
+    const traceId=button.dataset.id||$('auto-trace-select')?.value;
+    if(!traceId)return;
+    const trace=await api(AUTO_API+'/'+route(jobId)+'/trace/'+route(traceId));
+    if(autoState.selected!==jobId)return;
     const select=$('auto-trace-select');
-    const traceId=button.dataset.id||select.value;
-    const trace=await api(AUTO_API+'/'+route(autoState.selected)+'/trace/'+route(traceId));
-    select.value=traceId;
-    $('auto-trace').innerHTML=autoTraceView(trace)+rawDownload(trace,'实际调用记录');
-    if(button.dataset.id)$('auto-trace').scrollIntoView({block:'start'});
+    if(select&&[...select.options].some(option=>option.value===traceId))select.value=traceId;
+    let panel=$('auto-trace');
+    if(!panel){
+      panel=document.createElement('div');
+      panel.id='auto-trace';
+      panel.className='auto-trace-panel';
+      if(button.isConnected)button.after(panel);
+      else $('auto-result').append(panel);
+    }
+    panel.dataset.traceId=traceId;
+    panel.innerHTML=autoTraceView(trace)+rawDownload(trace,'实际调用记录');
+    if(button.dataset.id)panel.scrollIntoView({block:'start'});
   });
 });
 
 window.addEventListener('resize',drawAutoRadar);
+$('auto-result').addEventListener('toggle',event=>{
+  if(event.target.matches('.auto-overall-results')&&event.target.open)requestAnimationFrame(drawAutoRadar);
+},true);
+window.addEventListener('online',()=>autoRestoreFeedbackDrafts(autoState.job));
 window.addEventListener('hashchange',()=>{
   const match=/^#automatic-evaluation(?:=(.+))?$/.exec(location.hash);
   if(!match || SHARE)return;
